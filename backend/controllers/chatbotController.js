@@ -1,5 +1,6 @@
 const Lead = require('../models/Lead');
 const mistralService = require('../services/mistralService');
+const webSearchService = require('../services/webSearchService');
 
 // Helper function to extract user information from messages
 const extractUserInfo = (message) => {
@@ -92,7 +93,7 @@ const generateTemplateResponse = (message, leadInfo) => {
   return "Thank you for your message. How else can I assist you with your property search?";
 };
 
-// Generate response using Mistral AI or fallback to template
+// Generate response using Mistral AI with deep property knowledge or fallback to template
 async function generateResponse(message, leadInfo, messageHistory, uiSize) {
   try {
     // Add UI size information to the context if available
@@ -105,16 +106,57 @@ async function generateResponse(message, leadInfo, messageHistory, uiSize) {
       };
     }
     
+    
     // Add instruction to enforce one-question-at-a-time approach
     contextWithUiInfo.oneQuestionAtATime = true;
     
-    // Use Mistral AI to generate response with enhanced context
+    // Always perform web search for every query with improved handling
+    let searchResults = [];
+    console.log('Performing web search for real estate information...');
+    
+    try {
+      // First check if the query needs web search
+      const needsSearch = webSearchService.needsWebSearch(message);
+      
+      if (needsSearch) {
+        console.log('Query requires web search, fetching latest information...');
+        searchResults = await webSearchService.searchRealEstateInfo(message);
+        console.log(`Found ${searchResults.length} search results`);
+        
+        // Validate search results quality
+        if (!searchResults || !Array.isArray(searchResults) || searchResults.length === 0) {
+          console.log('No search results found, trying with modified query...');
+          // Try with a more generic query if specific one failed
+          const genericQuery = message.split(' ').slice(0, 3).join(' ') + ' real estate';
+          searchResults = await webSearchService.searchRealEstateInfo(genericQuery);
+          console.log(`Found ${searchResults.length} results with generic query`);
+          
+          // Log API key status for debugging
+          console.log('Google API Key Status:', process.env.GOOGLE_API_KEY ? 'Set' : 'Not Set');
+          console.log('Google Search Engine ID Status:', process.env.GOOGLE_SEARCH_ENGINE_ID ? 'Set' : 'Not Set');
+        }
+      } else {
+        console.log('Query does not require web search, using AI knowledge base');
+      }
+    } catch (searchError) {
+      console.error('Error during web search:', searchError.message);
+      if (searchError.response) {
+        console.error('Search API Error Response:', searchError.response.status, searchError.response.statusText);
+      }
+      // Continue with empty search results if search fails
+    }
+    
+    // Add search results to context for Mistral
+    contextWithUiInfo.searchResults = searchResults;
+    
+    // Use enhanced Mistral AI to generate comprehensive property research
+    console.log('Using Mistral AI for deep property research and insights...');
     const response = await mistralService.generateResponse(message, contextWithUiInfo, messageHistory);
     
     // Format response in a Notion-like style if needed
     return formatNotionStyleResponse(response);
   } catch (error) {
-    console.error('Error using Mistral AI, falling back to template responses:', error);
+    console.error('Error using Mistral AI for deep property research, falling back to template responses:', error);
     // Fallback to template-based responses
     return generateTemplateResponse(message, leadInfo);
   }
@@ -133,17 +175,24 @@ function formatNotionStyleResponse(response) {
     return heading.toUpperCase();
   });
   
-  // Ensure only one question is asked at a time
-  // Look for multiple question marks and keep only the first question
-  const questionMarks = withHeadings.match(/\?/g);
-  if (questionMarks && questionMarks.length > 1) {
-    // Find the position of the first question mark
-    const firstQuestionEnd = withHeadings.indexOf('?') + 1;
-    // Keep only the content up to the first question
-    return withHeadings.substring(0, firstQuestionEnd);
+  // Remove any questions from the response
+  let finalResponse = withHeadings;
+  
+  // Replace question marks with periods to convert questions to statements
+  finalResponse = finalResponse.replace(/([^.!?])\s*\?/g, '$1.');
+  
+  // Highlight search results section if present
+  if (finalResponse.includes('Here is some factual information related to your question')) {
+    finalResponse = finalResponse.replace(
+      'Here is some factual information related to your question',
+      '✅ Here is some factual information related to your question'
+    );
   }
   
-  return withHeadings;
+  // Ensure response doesn't end with a question
+  finalResponse = finalResponse.replace(/\?\s*$/, '.');
+  
+  return finalResponse;
 }
 
 // Process incoming chat message
@@ -205,9 +254,27 @@ exports.processMessage = async (req, res) => {
         setTimeout(() => reject(new Error('Response generation timed out')), 15000); // 15 second timeout
       });
       
+      // Log the lead information being passed to the AI service
+      console.log('Passing lead information to AI service:', {
+        name: lead.name,
+        budget: lead.budget,
+        preferredLocation: lead.preferredLocation,
+        propertyType: lead.propertyType,
+        messageHistoryCount: lead.messageHistory.length
+      });
+      
+      // Convert lead to a plain object to ensure all properties are passed correctly
+      const leadData = lead.toObject ? lead.toObject() : {
+        name: lead.name,
+        budget: lead.budget,
+        preferredLocation: lead.preferredLocation,
+        propertyType: lead.propertyType,
+        messageHistory: lead.messageHistory
+      };
+      
       // Race between the actual response and the timeout
       botResponse = await Promise.race([
-        generateResponse(message, lead, lead.messageHistory, uiSize),
+        generateResponse(message, leadData, lead.messageHistory, uiSize),
         timeoutPromise
       ]);
     } catch (aiError) {
